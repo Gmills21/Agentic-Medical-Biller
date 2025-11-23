@@ -4,3 +4,9 @@
 # Ignore all text files
 *.txt
 
+# Ignore SQLite database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+

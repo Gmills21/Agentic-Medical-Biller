@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import sqlite3
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
@@ -15,11 +16,27 @@ import pandas as pd
 CONVERSION_FACTOR = 32.35
 
 BASE_DIR = Path(__file__).resolve().parent
+CSV_DIR = BASE_DIR / "Medicare CSVS"
+DB_PATH = BASE_DIR / "medicare.db"
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Connect to the medicare.db SQLite database and return the connection object.
+    
+    Returns:
+        sqlite3.Connection: Database connection object
+        
+    Note:
+        The connection uses row_factory=sqlite3.Row for easier dictionary-like access.
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row  # Enable dictionary-like access to rows
+    return conn
 FILES = {
-    "zip_to_county": BASE_DIR / "Zip-County.csv",
-    "county_locality": BASE_DIR / "25LOCCO1.csv",
-    "gpci": BASE_DIR / "GPCI2025.csv",
-    "rvu": BASE_DIR / "PPRRVU25_JAN1.csv",
+    "zip_to_county": CSV_DIR / "Zip-County.csv",
+    "county_locality": CSV_DIR / "25LOCCO1.csv",
+    "gpci": CSV_DIR / "GPCI2025.csv",
+    "rvu": CSV_DIR / "PPRRVU25_JAN1.csv",
     "county_reference": BASE_DIR / "national_county.txt",
 }
 COUNTY_REFERENCE_URL = (
@@ -421,46 +438,189 @@ def _load_rvu_lookup() -> Dict[str, Dict[str, float]]:
     return df.set_index("HCPCS")[["PW_RVU", "PE_RVU", "MP_RVU"]].to_dict("index")
 
 
-ZIP_TO_COUNTY = _load_zip_to_county()
-ZIP_TO_COUNTY_GROUPED = ZIP_TO_COUNTY.groupby("ZIP")
-COUNTY_CODE_TO_NAME = _load_county_reference()
-LOCALITY_LOOKUP = LocalityLookup(_load_county_locality())
-GPCI_LOOKUP = _load_gpci_lookup()
-RVU_LOOKUP = _load_rvu_lookup()
+# Check if database exists and has tables, otherwise use CSV-based lookups
+USE_DATABASE = False
+if DB_PATH.exists():
+    try:
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='zip_to_county'"
+        )
+        USE_DATABASE = cursor.fetchone() is not None
+        conn.close()
+    except Exception:
+        USE_DATABASE = False
+
+if USE_DATABASE:
+    # SQL-based lookups (more scalable)
+    pass  # Functions defined below use SQL queries
+else:
+    # CSV-based lookups (fallback for backward compatibility)
+    ZIP_TO_COUNTY = _load_zip_to_county()
+    ZIP_TO_COUNTY_GROUPED = ZIP_TO_COUNTY.groupby("ZIP")
+    COUNTY_CODE_TO_NAME = _load_county_reference()
+    LOCALITY_LOOKUP = LocalityLookup(_load_county_locality())
+    GPCI_LOOKUP = _load_gpci_lookup()
+    RVU_LOOKUP = _load_rvu_lookup()
 
 
 def _select_county(zip_code: str) -> Tuple[str, str]:
-    try:
-        rows = ZIP_TO_COUNTY_GROUPED.get_group(zip_code)
-    except KeyError:
-        raise ValueError(f"ZIP code {zip_code} not found in ZIP-County data.")
-    best_row = rows.sort_values("RES_RATIO", ascending=False).iloc[0]
-    return best_row["COUNTY"], best_row["USPS_ZIP_PREF_STATE"]
+    """Select county for ZIP code using highest RES_RATIO."""
+    if USE_DATABASE:
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT county, state_abbr 
+                FROM zip_to_county 
+                WHERE zip = ? 
+                ORDER BY res_ratio DESC 
+                LIMIT 1
+                """,
+                (zip_code,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"ZIP code {zip_code} not found in ZIP-County data.")
+            result = (row["county"], row["state_abbr"])
+            return result
+        finally:
+            conn.close()
+    else:
+        # CSV-based fallback
+        try:
+            rows = ZIP_TO_COUNTY_GROUPED.get_group(zip_code)
+        except KeyError:
+            raise ValueError(f"ZIP code {zip_code} not found in ZIP-County data.")
+        best_row = rows.sort_values("RES_RATIO", ascending=False).iloc[0]
+        return best_row["COUNTY"], best_row["USPS_ZIP_PREF_STATE"]
+
+
+def _get_county_name(county_code: str) -> str:
+    """Get county name from county code."""
+    if USE_DATABASE:
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT county_name FROM county_reference WHERE county_code = ?",
+                (county_code,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"No county reference found for code {county_code}.")
+            result = row["county_name"]
+            return result
+        finally:
+            conn.close()
+    else:
+        # CSV-based fallback
+        county_name = COUNTY_CODE_TO_NAME.get(county_code)
+        if not county_name:
+            raise ValueError(f"No county reference found for code {county_code}.")
+        return county_name
 
 
 def _resolve_locality(county_code: str, state_abbr: str) -> LocalityEntry:
-    county_name = COUNTY_CODE_TO_NAME.get(county_code)
-    if not county_name:
-        raise ValueError(f"No county reference found for code {county_code}.")
-    return LOCALITY_LOOKUP.find(state_abbr, county_name)
+    """Resolve county to locality using SQL or CSV lookup."""
+    county_name = _get_county_name(county_code)
+    
+    if USE_DATABASE:
+        # SQL-based locality lookup
+        # First, try to find exact match in county_locality table
+        # This requires parsing the counties field, which is complex
+        # For now, use the CSV-based LocalityLookup class with database-loaded data
+        conn = get_db_connection()
+        try:
+            # Load locality data from database into LocalityLookup
+            cursor = conn.execute(
+                "SELECT mac, locality_number, state_label, locality_name, counties FROM county_locality"
+            )
+            rows = cursor.fetchall()
+            
+            # Convert to DataFrame for LocalityLookup
+            import pandas as pd
+            data = {
+                "MAC": [r["mac"] for r in rows],
+                "LocalityNumber": [r["locality_number"] for r in rows],
+                "StateLabel": [r["state_label"] for r in rows],
+                "LocalityName": [r["locality_name"] for r in rows],
+                "Counties": [r["counties"] for r in rows],
+            }
+            df = pd.DataFrame(data)
+            lookup = LocalityLookup(df)
+            return lookup.find(state_abbr, county_name)
+        finally:
+            conn.close()
+    else:
+        # CSV-based fallback
+        return LOCALITY_LOOKUP.find(state_abbr, county_name)
 
 
 def _fetch_gpci(entry: LocalityEntry) -> Dict[str, float]:
-    key = (entry.state_abbr, entry.locality_number)
-    gpci = GPCI_LOOKUP.get(key)
-    if not gpci:
-        raise ValueError(
-            f"GPCI multipliers missing for state {entry.state_abbr} "
-            f"locality {entry.locality_number}."
-        )
-    return gpci
+    """Fetch GPCI multipliers for locality."""
+    if USE_DATABASE:
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT pw_gpci, pe_gpci, mp_gpci 
+                FROM gpci 
+                WHERE state_abbr = ? AND locality_number = ?
+                """,
+                (entry.state_abbr, entry.locality_number),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(
+                    f"GPCI multipliers missing for state {entry.state_abbr} "
+                    f"locality {entry.locality_number}."
+                )
+            result = {
+                "PW_GPCI": float(row["pw_gpci"]),
+                "PE_GPCI": float(row["pe_gpci"]),
+                "MP_GPCI": float(row["mp_gpci"]),
+            }
+            return result
+        finally:
+            conn.close()
+    else:
+        # CSV-based fallback
+        key = (entry.state_abbr, entry.locality_number)
+        gpci = GPCI_LOOKUP.get(key)
+        if not gpci:
+            raise ValueError(
+                f"GPCI multipliers missing for state {entry.state_abbr} "
+                f"locality {entry.locality_number}."
+            )
+        return gpci
 
 
 def _fetch_rvu(cpt_code: str) -> Dict[str, float]:
-    rvu = RVU_LOOKUP.get(cpt_code)
-    if not rvu:
-        raise ValueError(f"CPT/HCPCS code {cpt_code} not found in RVU file.")
-    return rvu
+    """Fetch RVU values for CPT code."""
+    if USE_DATABASE:
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT pw_rvu, pe_rvu, mp_rvu FROM rvu WHERE hcpcs = ?",
+                (cpt_code,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"CPT/HCPCS code {cpt_code} not found in RVU file.")
+            result = {
+                "PW_RVU": float(row["pw_rvu"]),
+                "PE_RVU": float(row["pe_rvu"]),
+                "MP_RVU": float(row["mp_rvu"]),
+            }
+            return result
+        finally:
+            conn.close()
+    else:
+        # CSV-based fallback
+        rvu = RVU_LOOKUP.get(cpt_code)
+        if not rvu:
+            raise ValueError(f"CPT/HCPCS code {cpt_code} not found in RVU file.")
+        return rvu
 
 
 def get_medicare_price(cpt_code: str, zip_code: str) -> float:
